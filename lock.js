@@ -1,93 +1,115 @@
-const zookeeper = require("node-zookeeper-client");
+const zookeeper = require('node-zookeeper-client');
 
-const ZK_SERVER = "127.0.0.1:2181"; // Change to your ZooKeeper ensemble
-const LOCK_PATH = "/locks";
+const ZK_SERVER = '127.0.0.1:2181'; // ZooKeeper server
+const LOCK_NODE = '/lock';
 
-const client = zookeeper.createClient(ZK_SERVER);
+let client = zookeeper.createClient(ZK_SERVER);
+let myZNode = null;
+
+client.once('connected', async () => {
+    console.log('🔗 Connected to ZooKeeper');
+    await ensureLockNode();
+    await acquireLock();
+});
+
 client.connect();
 
-function acquireLock(isWriter = false, timeOut = 5000) {
-    const lockType = isWriter ? "write_" : "read_";
-    
-    client.create(
-        `${LOCK_PATH}/${lockType}`,
-        Buffer.from(lockType),
-        zookeeper.CreateMode.EPHEMERAL_SEQUENTIAL,
-        (error, path) => {
-            if (error) {
-                console.log("Failed to acquire lock:", error);
-                return;
-            }
-            console.log(`Lock request created: ${path}`);
-            
-            // Timeout handler if lock is not acquired in time
-            const timeOutId = setTimeout(() => {
-                console.log("Timeout! Could not acquire lock. Releasing...");
-                client.remove(path, () => {}); // Cleanup if waiting too long
-            }, timeOut);
+/**
+ * Ensure that the parent /lock ZNode exists.
+ */
+function ensureLockNode() {
+    return new Promise((resolve, reject) => {
+        client.exists(LOCK_NODE, (error, stat) => {
+            if (error) return reject(error);
+            if (stat) return resolve(); // Already exists
 
-            checkForSharedLock(path, isWriter, timeOutId);
-        }
-    );
+            client.create(LOCK_NODE, Buffer.from(''), zookeeper.ACL.OPEN_ACL_UNSAFE, zookeeper.CreateMode.PERSISTENT, (err) => {
+                if (err && err.code !== zookeeper.Exception.NODE_EXISTS) return reject(err);
+                resolve();
+            });
+        });
+    });
 }
 
-function checkForSharedLock(path, isWriter, timeOutId) {
-    client.getChildren(LOCK_PATH, (error, children) => {
-        if (error) {
-            console.log("Error getting children:", error);
-            return;
-        }
-        console.log('Current lock queue:', children);
-        
-        children.sort(); // Sort ZNodes to determine priority
-        const myLock = path.split("/").pop();
+/**
+ * Try to acquire a distributed lock.
+ */
+function acquireLock() {
+    return new Promise((resolve, reject) => {
+        client.create(`${LOCK_NODE}/lock-`, Buffer.from(''), zookeeper.ACL.OPEN_ACL_UNSAFE, zookeeper.CreateMode.EPHEMERAL_SEQUENTIAL, async (err, path) => {
+            if (err) return reject(err);
 
-        const hasWriter = children.some(child => child.startsWith("write_"));
-        const isFirst = children[0] === myLock;
+            myZNode = path;
+            console.log(`📝 Created lock node: ${myZNode}`);
 
-        if (isWriter) {
-            if (isFirst) {
-                console.log("✏️ Writer lock acquired:", myLock);
-                clearTimeout(timeOutId);
+            await checkLock();
+            resolve();
+        });
+    });
+}
+
+/**
+ * Check if the current ZNode has the lowest sequence (i.e., has the lock).
+ */
+function checkLock() {
+    return new Promise((resolve, reject) => {
+        client.getChildren(LOCK_NODE, (err, children) => {
+            if (err) return reject(err);
+
+            children.sort(); // Sort in ascending order
+            const smallestNode = `${LOCK_NODE}/${children[0]}`;
+
+            if (myZNode === smallestNode) {
+                console.log(`🔐 Lock acquired: ${myZNode}`);
+                performTask();
             } else {
-                console.log("🛑 Writer waiting for readers to finish...");
-                watchPreviousNode(myLock, children, timeOutId);
+                // Watch the node just before myZNode
+                const myIndex = children.indexOf(myZNode.replace(`${LOCK_NODE}/`, ''));
+                if (myIndex > 0) {
+                    const prevNode = `${LOCK_NODE}/${children[myIndex - 1]}`;
+                    console.log(`👀 Watching previous node: ${prevNode}`);
+                    watchNode(prevNode);
+                }
             }
-        } else {
-            if (!hasWriter) {
-                console.log("📖 Reader lock acquired:", myLock);
-                clearTimeout(timeOutId);
-            } else {
-                console.log("⏳ Reader waiting for writer...");
-                watchPreviousNode(myLock, children, timeOutId);
-            }
+            resolve();
+        });
+    });
+}
+
+/**
+ * Watch the previous ZNode for deletion.
+ */
+function watchNode(prevNode) {
+    client.exists(prevNode, (event) => {
+        if (event.type === zookeeper.Event.NODE_DELETED) {
+            console.log(`✅ Lock is now available (previous node deleted). Trying again...`);
+            checkLock();
         }
     });
 }
 
-function watchPreviousNode(myLock, children, timeOutId) {
-    const index = children.indexOf(myLock);
-    if (index > 0) {
-        const previousNode = `${LOCK_PATH}/${children[index - 1]}`;
-        
-        client.exists(previousNode, (event) => {
-            if (event && event.getType() === zookeeper.Event.NODE_DELETED) {
-                console.log(`🔔 Lock released, checking again...`);
-                checkForSharedLock(myLock, false, timeOutId);
+/**
+ * Perform the task and release the lock.
+ */
+function performTask() {
+    console.log(`🚀 Performing critical task...`);
+    setTimeout(() => {
+        releaseLock();
+    }, 2000);
+}
+
+/**
+ * Release the lock by deleting the ZNode.
+ */
+function releaseLock() {
+    if (myZNode) {
+        client.remove(myZNode, -1, (err) => {
+            if (err) {
+                console.error('❌ Error releasing lock:', err);
             } else {
-                console.log(`👀 Watching ${previousNode} for deletion...`);
-                watchPreviousNode(myLock, children, timeOutId);
+                console.log(`🔓 Lock released: ${myZNode}`);
             }
+            client.close();
         });
     }
 }
-
-// Ensure the locks directory exists
-client.mkdirp(LOCK_PATH, (error) => {
-    if (!error || error.code === zookeeper.Exception.NODE_EXISTS) {
-        const isWriter = process.argv.includes("writer"); // Run as writer if "writer" argument is passed
-        acquireLock(isWriter);
-    } else {
-        console.log("Error creating lock directory:", error);
-    }
-});
