@@ -6,7 +6,7 @@ const LOCK_PATH = "/locks";
 const client = zookeeper.createClient(ZK_SERVER);
 client.connect();
 
-function acquireLock() {
+function acquireLock(timeOut = 5000) {
     client.create(
         `${LOCK_PATH}/lock_`,
         Buffer.from("lock"),
@@ -17,12 +17,17 @@ function acquireLock() {
                 return;
             }
             console.log(`Lock request created: ${path}`);
-            checkForLock(path);
+            const timeOutId = setTimeout(() => {
+                console.log("Timeout! Could not acquire lock.");
+                client.remove(path, () => {}); // Clean up if waiting too long
+            }, timeOut);
+
+            checkForLock(path, timeOutId);
         }
     );
 }
 
-function checkForLock(path) {
+function checkForLock(path, timeOutId) {
     client.getChildren(LOCK_PATH, (error, children) => {
         if (error) {
             console.log("Error getting children:", error);
@@ -33,23 +38,33 @@ function checkForLock(path) {
         const myLock = path.split("/").pop();
         if (children[0] === myLock) {
             console.log("Lock acquired:", myLock);
+            clearTimeout(timeOutId);
         } else {
             console.log(`Waiting for lock... Current lock holder: ${children[0]}`);
-            watchPreviousNode(myLock, children);
+            watchPreviousNode(myLock, children, timeOutId);
         }
     });
 }
 
-function watchPreviousNode(myLock, children) {
+function watchPreviousNode(myLock, children, timeOutId) {
     const index = children.indexOf(myLock);
     if (index > 0) {
         const previousNode = `${LOCK_PATH}/${children[index - 1]}`;
+        
         client.exists(previousNode, (event) => {
             console.log(`Lock released, checking again: ${event}`);
-            checkForLock(myLock);
+            
+            // Ensure we continue watching for the lock
+            if (event && event.getType() === zookeeper.Event.NODE_DELETED) {
+                checkForLock(myLock, timeOutId);
+            } else {
+                // Re-watch in case of a missed event
+                watchPreviousNode(myLock, children, timeOutId);
+            }
         });
     }
 }
+
 
 // Ensure the locks directory exists
 client.mkdirp(LOCK_PATH, (error) => {
