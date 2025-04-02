@@ -6,10 +6,12 @@ const LOCK_PATH = "/locks";
 const client = zookeeper.createClient(ZK_SERVER);
 client.connect();
 
-function acquireLock(timeOut = 5000) {
+function acquireLock(isWriter = false, timeOut = 5000) {
+    const lockType = isWriter ? "write_" : "read_";
+    
     client.create(
-        `${LOCK_PATH}/lock_`,
-        Buffer.from("lock"),
+        `${LOCK_PATH}/${lockType}`,
+        Buffer.from(lockType),
         zookeeper.CreateMode.EPHEMERAL_SEQUENTIAL,
         (error, path) => {
             if (error) {
@@ -17,31 +19,48 @@ function acquireLock(timeOut = 5000) {
                 return;
             }
             console.log(`Lock request created: ${path}`);
+            
+            // Timeout handler if lock is not acquired in time
             const timeOutId = setTimeout(() => {
-                console.log("Timeout! Could not acquire lock.");
-                client.remove(path, () => {}); // Clean up if waiting too long
+                console.log("Timeout! Could not acquire lock. Releasing...");
+                client.remove(path, () => {}); // Cleanup if waiting too long
             }, timeOut);
 
-            checkForLock(path, timeOutId);
+            checkForSharedLock(path, isWriter, timeOutId);
         }
     );
 }
 
-function checkForLock(path, timeOutId) {
+function checkForSharedLock(path, isWriter, timeOutId) {
     client.getChildren(LOCK_PATH, (error, children) => {
         if (error) {
             console.log("Error getting children:", error);
             return;
         }
-        console.log('children: ', children);
-        children.sort(); // Sort to get the smallest ZNode
+        console.log('Current lock queue:', children);
+        
+        children.sort(); // Sort ZNodes to determine priority
         const myLock = path.split("/").pop();
-        if (children[0] === myLock) {
-            console.log("Lock acquired:", myLock);
-            clearTimeout(timeOutId);
+
+        const hasWriter = children.some(child => child.startsWith("write_"));
+        const isFirst = children[0] === myLock;
+
+        if (isWriter) {
+            if (isFirst) {
+                console.log("✏️ Writer lock acquired:", myLock);
+                clearTimeout(timeOutId);
+            } else {
+                console.log("🛑 Writer waiting for readers to finish...");
+                watchPreviousNode(myLock, children, timeOutId);
+            }
         } else {
-            console.log(`Waiting for lock... Current lock holder: ${children[0]}`);
-            watchPreviousNode(myLock, children, timeOutId);
+            if (!hasWriter) {
+                console.log("📖 Reader lock acquired:", myLock);
+                clearTimeout(timeOutId);
+            } else {
+                console.log("⏳ Reader waiting for writer...");
+                watchPreviousNode(myLock, children, timeOutId);
+            }
         }
     });
 }
@@ -52,24 +71,22 @@ function watchPreviousNode(myLock, children, timeOutId) {
         const previousNode = `${LOCK_PATH}/${children[index - 1]}`;
         
         client.exists(previousNode, (event) => {
-            console.log(`Lock released, checking again: ${event}`);
-            
-            // Ensure we continue watching for the lock
             if (event && event.getType() === zookeeper.Event.NODE_DELETED) {
-                checkForLock(myLock, timeOutId);
+                console.log(`🔔 Lock released, checking again...`);
+                checkForSharedLock(myLock, false, timeOutId);
             } else {
-                // Re-watch in case of a missed event
+                console.log(`👀 Watching ${previousNode} for deletion...`);
                 watchPreviousNode(myLock, children, timeOutId);
             }
         });
     }
 }
 
-
 // Ensure the locks directory exists
 client.mkdirp(LOCK_PATH, (error) => {
     if (!error || error.code === zookeeper.Exception.NODE_EXISTS) {
-        acquireLock();
+        const isWriter = process.argv.includes("writer"); // Run as writer if "writer" argument is passed
+        acquireLock(isWriter);
     } else {
         console.log("Error creating lock directory:", error);
     }
